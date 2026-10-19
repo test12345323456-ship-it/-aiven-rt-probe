@@ -16,48 +16,21 @@ def tcp(ip, port, timeout=2):
         try: s.close()
         except Exception: pass
 
-def http(url, headers=None, method="GET", timeout=4, insecure=False):
+def http(url, headers=None, method="GET", timeout=4, insecure=False, n=3000):
     try:
         ctx = ssl._create_unverified_context() if insecure else None
-        op = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx),
-                                         urllib.request.HTTPRedirectHandler())
+        op = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
         req = urllib.request.Request(url, headers=headers or {}, method=method)
         r = op.open(req, timeout=timeout)
-        return {"status": r.status, "headers": dict(r.headers), "body": r.read(700).decode("utf-8", "replace")}
+        return {"status": r.status, "headers": dict(r.headers), "body": r.read(n).decode("utf-8", "replace")}
     except urllib.error.HTTPError as e:
         try:
-            body = e.read(700).decode("utf-8", "replace")
+            body = e.read(n).decode("utf-8", "replace")
         except Exception:
             body = ""
         return {"status": e.code, "headers": dict(e.headers or {}), "body": body}
     except Exception as e:
         return {"error": type(e).__name__ + ": " + str(e)}
-
-def cert_info(ip, port, timeout=4):
-    try:
-        ctx = ssl._create_unverified_context()
-        s = socket.create_connection((ip, port), timeout=timeout)
-        ss = ctx.wrap_socket(s, server_hostname=ip)
-        c = ss.getpeercert(binary_form=False) or binary_form_false
-        raw = ss.getpeercert(binary_form=True)
-        ss.close()
-        subj = dict(x[0] for x in c.get("subject", []))
-        san = c.get("subjectAltName", [])
-        import hashlib
-        return {"subject": subj, "san": san[:12], "sha256": hashlib.sha256(raw).hexdigest()}
-    except Exception as e:
-        import hashlib
-        try:
-            ctx = ssl._create_unverified_context(); s = socket.create_connection((ip, port), timeout=timeout)
-            ss = ctx.wrap_socket(s, server_hostname=ip)
-            raw = ss.getpeercert(binary_form=True)
-            der = hashlib.sha256(raw).hexdigest()
-            ss.close()
-            return {"sha256": der, "note": "no-verify-to-ip"}
-        except Exception as e2:
-            return {"error": type(e2).__name__ + ": " + str(e2)}
-
-binary_form_false = None
 
 def safe(p, n=1500):
     try:
@@ -65,23 +38,32 @@ def safe(p, n=1500):
     except Exception as e:
         return type(e).__name__
 
-def sweep(ips, ports):
-    return {ip: {str(p): tcp(ip, p) for p in ports} for ip in ips}
-
 def run_all():
     o = {}
-    o["logs"] = {}
-    for f in os.listdir("/alloc/logs") if os.path.isdir("/alloc/logs") else []:
-        if f.startswith("."):
-            continue
-        o["logs"]["/alloc/logs/" + f] = safe("/alloc/logs/" + f, 1300)
-    o["nb_ports"] = sweep([NB], [22, 3000, 4646, 5432, 8200, 8500, 9000, 9090, 8000, 8443])
-    o["nb_http"] = http("http://" + NB + "/")
-    o["nb_https_verify"] = cert_info(NB, 443)
-    o["nb_https"] = http("https://" + NB + "/", insecure=True)
-    o["sweep_extra"] = sweep(["10.156.1.1", "10.156.1.100", "10.156.2.1"], [53, 80])
-    o["gcp_meta_now"] = http("http://metadata.google.internal/computeMetadata/v1/",
-                             {"Metadata-Flavor": "Google"})
+    # parallel full sweep of the node bridge
+    result = {}
+    work = [(ip, p) for ip in ("10.156.0.%d" % i for i in range(2, 255)) for p in (22, 80, 443)]
+    sem = threading.BoundedSemaphore(48)
+    lock = threading.Lock()
+    def worker(item):
+        ip, p = item
+        r = tcp(ip, p, 2.2)
+        if r == "OPEN":
+            with lock:
+                result.setdefault(ip, []).append(p)
+    ths = []
+    for item in work:
+        t = threading.Thread(target=worker, args=(item,)); t.start(); ths.append(t)
+        if len(ths) > 200:
+            for t in ths: t.join()
+            ths = []
+    for t in ths: t.join()
+    o["full_sweep"] = result
+    # OSD surface
+    o["osd_root"] = http("http://" + NB + "/", n=2600)
+    o["osd_authinfo"] = http("http://" + NB + "/api/core/security/authinfo")
+    o["osd_authinfo_https"] = http("https://" + NB + "/api/core/security/authinfo", insecure=True)
+    o["osd_system"] = http("http://" + NB + "/api/system/info")
     return o
 
 def loop():
@@ -90,7 +72,7 @@ def loop():
             CACHE.update(run_all())
         except Exception as e:
             CACHE["loop_error"] = type(e).__name__
-        threading.Event().wait(60)
+        threading.Event().wait(120)
 
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
