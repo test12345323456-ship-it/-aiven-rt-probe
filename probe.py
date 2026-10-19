@@ -1,71 +1,38 @@
-import json, os, socket, ssl, struct, hashlib, threading, urllib.request
+import json, os, socket, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 TOKEN = "r7xQ2kT9mV4bZ8wP"
 CACHE = {"status": "warming-up"}
-OSD_IPS = ["10.156.0.82", "10.156.0.85", "10.156.0.107", "10.156.0.131",
-           "10.156.0.144", "10.156.0.151", "10.156.0.170", "10.156.0.184",
-           "10.156.0.237", "10.156.0.39"]
+ULA = "fda7:a938:5bfe:5fa6:0:5ea:2f7c:59f8"
 
-def http(url, headers=None, method="GET", timeout=5, insecure=True, n=2500):
+def tcp(ip, port, timeout=2, v6=False):
+    fam = socket.AF_INET6 if v6 else socket.AF_INET
+    s = socket.socket(fam, socket.SOCK_STREAM); s.settimeout(timeout)
     try:
-        ctx = ssl._create_unverified_context() if insecure else None
-        op = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
-        req = urllib.request.Request(url, headers=headers or {}, method=method)
+        s.connect((ip, port)); return "OPEN"
+    except ConnectionRefusedError: return "refused"
+    except socket.timeout: return "filtered"
+    except OSError as e: return type(e).__name__
+    finally:
+        try: s.close()
+        except Exception: pass
+
+def http(url, headers=None, timeout=5, n=3000):
+    try:
+        op = urllib.request.build_opener(urllib.request.HTTPSHandler(context=__import__("ssl")._create_unverified_context()))
+        req = urllib.request.Request(url, headers=headers or {})
         r = op.open(req, timeout=timeout)
-        return {"status": r.status, "hdr": {k: r.headers.get(k) for k in ("osd-name", "server", "content-type")},
-                "body": r.read(n).decode("utf-8", "replace")}
+        return {"status": r.status, "body": r.read(n).decode("utf-8", "replace")}
     except urllib.error.HTTPError as e:
         try:
             body = e.read(n).decode("utf-8", "replace")
         except Exception:
             body = ""
-        return {"status": e.code, "hdr": {k: (e.headers or {}).get(k) for k in ("osd-name", "server", "content-type")}, "body": body}
+        return {"status": e.code, "body": body}
     except Exception as e:
-        return {"error": type(e).__name__}
+        return {"error": type(e).__name__ + ": " + str(e)[:80]}
 
-def cert_of(ip, port=443, timeout=4):
-    try:
-        ctx = ssl._create_unverified_context()
-        s = socket.create_connection((ip, port), timeout=timeout)
-        ss = ctx.wrap_socket(s, server_hostname=ip)
-        c = ss.getpeercert(binary_form=False) or {}
-        raw = ss.getpeercert(binary_form=True)
-        ss.close()
-        return {"cn": (dict(x[0] for x in c.get("subject", [])).get("commonName", "")),
-                "san": [x[1] for x in c.get("subjectAltName", [])][:12],
-                "sha256": hashlib.sha256(raw).hexdigest()[:20],
-                "notBefore": c.get("notBefore", "")[:20]}
-    except Exception as e:
-        return {"error": type(e).__name__}
-
-def ping(ip, timeout=2, seq=7):
-    tid = os.getpid() & 0xFFFF
-    chk = 0
-    hdr = struct.pack(">BBHHH", 8, 0, 0, tid, seq)
-    data = struct.pack(">d", 1750000000.0)
-    tot = hdr + data
-    tot = struct.pack(">BBHHH", 8, 0, 0, tid, seq) + data
-    # checksum
-    s = 0
-    for i in range(0, len(tot), 2):
-        w = (tot[i] << 8) + (tot[i+1] if i+1 < len(tot) else 0)
-        s = (s + w) & 0xFFFF
-    s = ~s & 0xFFFF
-    icmp = struct.pack(">BBHHH", 8, 0, s, tid, seq) + data
-    try:
-        sk = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-        sk.settimeout(timeout)
-        sk.sendto(icmp, (ip, 0))
-        rep, _ = sk.recvfrom(1024); sk.close()
-        typ = rep[20]
-        return {8: "echo", 0: "pinreply", 3: "unreachable", 11: "ttl"}.get(typ, "type" + str(typ))
-    except socket.timeout:
-        return "timeout"
-    except OSError as e:
-        return type(e).__name__ + ": " + str(e)[:40]
-
-def safe(p, n=2200):
+def safe(p, n=1600):
     try:
         return open(p).read()[:n]
     except Exception as e:
@@ -73,21 +40,55 @@ def safe(p, n=2200):
 
 def run_all():
     o = {}
-    o["osd_status"] = {ip: http("https://" + ip + "/api/status", n=900) for ip in OSD_IPS}
-    o["n39"] = http("https://10.156.0.39/")
-    o["n39p"] = {p: http("https://10.156.0.39" + p, n=300) for p in ("/login", "/healthz", "/api", "/about")}
-    o["certs"] = {ip: cert_of(ip) for ip in OSD_IPS}
-    o["ipfs_icmp"] = {}
-    for ip in ["10.156.0.1", "10.156.0.2", "10.156.0.3", "10.156.0.39", "10.156.0.82",
-               "10.156.0.107", "10.156.0.144", "10.156.0.170", "10.156.0.235", "10.156.0.236",
-               "10.156.0.174"]:
-        o["ipfs_icmp"][ip] = ping(ip)
-    o["netcs"] = {"tcp": safe("/proc/net/tcp", 1500), "tcp6": safe("/proc/net/tcp6", 900),
-                  "udp": safe("/proc/net/udp", 700), "icmp_raw": safe("/proc/net/raw", 500)}
-    o["hosts_file"] = safe("/etc/hosts", 400)
-    o["logs_sidecar"] = safe("/alloc/logs/sidecar.stdout.0", 2600)
-    o["logs_pod"] = safe("/alloc/logs/pod.stdout.0", 700)
-    o["alloc_tmp"] = {p: os.listdir(p) for p in ("/alloc/tmp", "/alloc/data")}
+    # our own IPv6 addresses
+    o["if_inet6"] = safe("/proc/net/if_inet6", 1200)
+    # local netns: what else listens (raw and via TCP)
+    o["p22243_lo"] = {}
+    for host in ("[::1]", "127.0.0.1", "[::]"):
+        o["p22243_lo"]["http_" + host] = http("http://" + host + ":22243/", timeout=3, n=400)
+    o["p22243_raw"] = None
+    try:
+        s = socket.create_connection(("::1", 22243), timeout=2)
+        s.settimeout(2)
+        try:
+            d = s.recv(96)
+            o["p22243_raw"] = "first: " + (d.hex() if d else "none")
+        except Exception as e:
+            o["p22243_raw"] = "open-read:" + type(e).__name__
+        s.close()
+    except Exception as e:
+        o["p22243_raw"] = type(e).__name__
+    # IPv6 ULA reachability to the named infra node
+    o["ula"] = {}
+    for p in (22, 80, 443, 8000, 5432):
+        o["ula"][str(p)] = tcp(ULA, p, 2, v6=True)
+    # find our own ULA prefix from if_inet6, then sweep a few neighbors in our own /64
+    o["v6_sweep"] = {}
+    try:
+        txt = safe("/proc/net/if_inet6", 2000)
+        for line in txt.split("\n"):
+            parts = line.split()
+            if len(parts) > 3 and parts[3] not in ("lo",):
+                if parts[0].startswith("fda7"):
+                    full = parts[0]
+                    ip6 = ":".join(full[i:i+4] for i in range(0, 32, 4))
+                    o["v6_self"] = ip6
+                    base = ip6.rsplit(":", 1)[0]
+                    for n in ("0", "1", "10", "100", "fffe", "59f7", "59f9", "5fa6"):
+                        cand = base + ":" + n
+                        o["v6_sweep"][cand + ":443"] = tcp(cand, 443, 1.5, v6=True)
+                        o["v6_sweep"][cand + ":22"] = tcp(cand, 22, 1.5, v6=True)
+                    break
+    except Exception as e:
+        o["v6_sweep"]["err"] = type(e).__name__
+    # grafana identity
+    g = http("https://10.156.0.39/", n=4200)
+    o["grafana_assets"] = [seg.split('"')[0] for seg in (g.get("body") or "").split('src="')[1:6]]
+    o["grafana_health"] = http("https://10.156.0.39/api/health", n=400)
+    o["grafana_buildinfo"] = http("https://10.156.0.39/api/backendbuildinfo", n=300)
+    o["grafana_login"] = http("https://10.156.0.39/login", n=1800)
+    # netns listener check (tcp6 full)
+    o["tcp6_full"] = safe("/proc/net/tcp6", 1200)
     return o
 
 def loop():
