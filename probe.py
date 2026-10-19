@@ -1,84 +1,91 @@
-import json, os, ssl, socket, threading, urllib.request, urllib.error, urllib.parse, hashlib
+import json, os, re, ssl, socket, threading, urllib.request, urllib.error, urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 TOKEN = "r7xQ2kT9mV4bZ8wP"
 CACHE = {"status": "warming-up"}
+OSD = ["10.156.0.82","10.156.0.85","10.156.0.107","10.156.0.131","10.156.0.144",
+       "10.156.0.151","10.156.0.170","10.156.0.184","10.156.0.237"]
 
-PORTS = [22,80,443,3000,4646,4647,5432,5601,6379,6443,8000,8080,8443,8500,8501,8502,
-         8888,9000,9090,9091,9092,9200,9300,10250,11211,2181,22243,2375,2376,2379,2380,
-         26247,27017,33046,2049,10000]
-
-def scan_bridge():
-    import concurrent.futures as cf
-    self_v4 = "10.156.0.174"
-    addrs = [f"10.156.0.{i}" for i in range(2,255) if f"10.156.0.{i}" != self_v4]
-    def chk(a):
-        ip, port = a
-        s = socket.socket(); s.settimeout(0.7)
-        try:
-            return (ip, port, s.connect_ex((ip, port)) == 0)
-        except Exception:
-            return (ip, port, False)
-        finally:
-            try: s.close()
-            except Exception: pass
-    out = {}
-    with cf.ThreadPoolExecutor(max_workers=256) as ex:
-        for ip, port, ok in ex.map(chk, [(ip, p) for ip in addrs for p in PORTS]):
-            if ok:
-                out.setdefault(ip, []).append(port)
-    return out
-
-def ident(ip, port, timeout=2):
+def http(url, timeout=4, n=9000):
     try:
         ctx = ssl._create_unverified_context()
-        if port in (443, 8443, 3000, 5601, 9200, 9090, 9091, 10000, 6443, 10250):
-            u = f"https://{ip}:{port}/"
-            op = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
-        else:
-            u = f"http://{ip}:{port}/"
-            op = urllib.request.build_opener()
-        req = urllib.request.Request(u, headers={"User-Agent": "rtprobe-id"})
-        r = op.open(req, timeout=timeout)
-        return {"status": r.status, "server": r.headers.get("Server", ""),
-                "head": r.read(120).decode("utf-8", "replace")}
+        op = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+        r = op.open(urllib.request.Request(url, headers={"User-Agent": "rtprobe-id"}), timeout=timeout)
+        return {"status": r.status, "headers": {k.lower(): v for k, v in r.headers.items()},
+                "body": r.read(n).decode("utf-8", "replace")}
     except urllib.error.HTTPError as e:
-        return {"status": e.code, "server": (e.headers or {}).get("Server", ""),
-                "head": (e.read(120).decode("utf-8", "replace") if e.fp else "")}
+        try: body = e.read(n).decode("utf-8", "replace")
+        except Exception: body = ""
+        return {"status": e.code, "headers": {k.lower(): v for k, v in (e.headers or {}).items()}, "body": body}
+    except Exception as e:
+        return {"error": type(e).__name__}
+
+def tls_fp(ip, port=443):
+    try:
+        import hashlib
+        ctx = ssl._create_unverified_context()
+        s = socket.socket(); s.settimeout(3); s.connect((ip, port))
+        c = ctx.wrap_socket(s)
+        der = c.getpeercert(binary_form=True)
+        ver = c.version(); cipher = c.cipher()
+        c.close()
+        return {"sha256": hashlib.sha256(der).hexdigest()[:24], "tls": ver,
+                "cipher": cipher[0] if cipher else None}
     except Exception as e:
         return {"err": type(e).__name__}
 
+def self_v6(gua):
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM); s.settimeout(3)
+        s.connect((gua, 8000))
+        s.send(f"GET /{TOKEN} HTTP/1.1\r\nHost: gua\r\nConnection: close\r\n\r\n".encode())
+        d = s.recv(160)
+        s.close()
+        return d.decode("utf-8", "replace").split("\r\n")[0]
+    except Exception as e:
+        return type(e).__name__ + ":" + str(e)[:60]
+
 def run_all():
     o = {}
+    # self v6 listener test
     try:
-        o["scan"] = scan_bridge()
+        for ln in open("/proc/net/if_inet6").read().split("\n"):
+            p = ln.split()
+            if len(p) > 5 and p[5] == "eth0" and not p[0].startswith("fe80") and p[1] != "01":
+                h = p[0]; groups = [h[i:i+4] for i in range(0, 32, 4)]
+                gua = ":".join(groups).rstrip(":0") + "::" if groups[-1] == "0000" else ":".join(groups)
+                # build canonical: drop trailing zero groups, no compression needed
+                gua = ":".join(groups).replace(":0:0:", "::", 1)
+                o["gua"] = ":".join(groups)
+                o["v6_selftest"] = self_v6(gua)
+                break
     except Exception as e:
-        o["scan_err"] = type(e).__name__ + ":" + str(e)[:80]
-    try:
-        idn = {}
-        for ip, ports in (o.get("scan") or {}).items():
-            for p in ports:
-                if p in (80, 443, 3000, 5601, 8000, 8080, 8443, 8888, 9000, 9090, 9091, 9200, 10000, 10250):
-                    idn[f"{ip}:{p}"] = ident(ip, p)
-        o["ident"] = idn
-    except Exception as e:
-        o["ident_err"] = type(e).__name__ + ":" + str(e)[:80]
-    try:
-        u = urllib.parse.urlparse(os.environ.get("DATABASE_URL", ""))
-        if u.hostname:
-            o["cred"] = {"user": u.username, "host": u.hostname, "port": u.port,
-                         "db": u.path.lstrip("/"), "pw_len": len(u.password or "")}
-            import psycopg
-            conn = psycopg.connect(host=u.hostname, port=u.port or 5432, dbname=u.path.lstrip("/"),
-                                   user=u.username, password=u.password, sslmode="require", connect_timeout=8)
-            cur = conn.cursor(); cur.execute("SELECT version()"); o["pg"] = cur.fetchone()[0][:50]
-            cur.close(); conn.close()
-    except Exception as e:
-        o["pg_err"] = type(e).__name__ + ":" + str(e)[:80]
-    try:
-        o["self6"] = open("/proc/net/if_inet6").read()[:400]
-    except Exception as e:
-        o["self6"] = type(e).__name__
+        o["v6_selftest"] = "parse:" + type(e).__name__
+
+    # OSD metadata: login page versions + headers + TLS fp
+    o["osd_meta"] = {}
+    for ip in OSD:
+        r = http(f"https://{ip}/login", n=9000)
+        meta = {"status": r.get("status"), "err": r.get("error")}
+        if r.get("headers"):
+            h = r["headers"]
+            meta["headers"] = {k: str(v)[:200] for k, v in h.items() if k in
+                               ("osd-name", "server", "x-content-type-options", "www-authenticate",
+                                "location", "set-cookie", "content-type")}
+        b = r.get("body") or ""
+        vers = set(re.findall(r'"version"\s*:\s*"([0-9][0-9.]*)"', b))
+        builds = set(re.findall(r'"buildNumber"\s*:\s*(\d+)', b))
+        meta["versions"] = sorted(vers)[:6]
+        meta["build"] = sorted(builds)[:3]
+        meta["injected_meta"] = "kbn-injected-metadata" in b or "opensearchDashboards" in b
+        o["osd_meta"][ip] = meta
+    o["osd_tls"] = {ip: tls_fp(ip) for ip in OSD}
+
+    # Grafana + connect metadata
+    g = http("https://10.156.0.39/api/health", n=400)
+    o["grafana_health"] = {"status": g.get("status"), "body": (g.get("body") or "")[:200]}
+    o["grafana_tls"] = tls_fp("10.156.0.39")
+    o["cnt_tls"] = {ip: tls_fp(ip) for ip in ("10.156.0.176","10.156.0.179","10.156.0.183")}
     return o
 
 def loop():
@@ -87,7 +94,7 @@ def loop():
             CACHE.update(run_all())
         except Exception as e:
             CACHE["loop_error"] = type(e).__name__ + ": " + str(e)[:140]
-        threading.Event().wait(90)
+        threading.Event().wait(120)
 
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
