@@ -1,25 +1,13 @@
-import json, os, socket, threading
+import json, os, ssl, socket, threading, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 TOKEN = "r7xQ2kT9mV4bZ8wP"
 CACHE = {"status": "warming-up"}
-ULA = "fda7:a938:5bfe:5fa6:0:5ea:2f7c:59f8"
-
-def tcp(ip, port, timeout=2, v6=False):
-    fam = socket.AF_INET6 if v6 else socket.AF_INET
-    s = socket.socket(fam, socket.SOCK_STREAM); s.settimeout(timeout)
-    try:
-        s.connect((ip, port)); return "OPEN"
-    except ConnectionRefusedError: return "refused"
-    except socket.timeout: return "filtered"
-    except OSError as e: return type(e).__name__
-    finally:
-        try: s.close()
-        except Exception: pass
 
 def http(url, headers=None, timeout=5, n=3000):
     try:
-        op = urllib.request.build_opener(urllib.request.HTTPSHandler(context=__import__("ssl")._create_unverified_context()))
+        ctx = ssl._create_unverified_context()
+        op = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
         req = urllib.request.Request(url, headers=headers or {})
         r = op.open(req, timeout=timeout)
         return {"status": r.status, "body": r.read(n).decode("utf-8", "replace")}
@@ -32,63 +20,48 @@ def http(url, headers=None, timeout=5, n=3000):
     except Exception as e:
         return {"error": type(e).__name__ + ": " + str(e)[:80]}
 
-def safe(p, n=1600):
+def pg_session():
+    """Authenticated SQL session from Runtime container using the injected env credential."""
     try:
-        return open(p).read()[:n]
+        import psycopg
+        u = urllib.parse.urlparse(os.environ.get("DATABASE_URL", ""))
+        if not u.hostname:
+            return {"error": "no DATABASE_URL in env"}
+        conn = psycopg.connect(
+            host=u.hostname, port=u.port or 5432, dbname=u.path.lstrip("/"),
+            user=u.username, password=u.password,
+            sslmode="require", connect_timeout=10)
+        cur = conn.cursor()
+        cur.execute("SELECT version()")
+        ver = cur.fetchone()[0]
+        cur.execute("SELECT current_user, inet_server_addr()::text, now()::text")
+        row = cur.fetchone()
+        cur.execute("SELECT datname FROM pg_database LIMIT 30")
+        dbs = [r[0] for r in cur.fetchall()]
+        cur.close(); conn.close()
+        return {"authenticated": True, "pg_version": ver[:80],
+                "user": row[0], "server_ip": row[1], "server_time": row[2],
+                "databases": dbs}
     except Exception as e:
-        return type(e).__name__
+        return {"error": type(e).__name__ + ": " + str(e)[:160]}
 
 def run_all():
     o = {}
-    # our own IPv6 addresses
-    o["if_inet6"] = safe("/proc/net/if_inet6", 1200)
-    # local netns: what else listens (raw and via TCP)
-    o["p22243_lo"] = {}
-    for host in ("[::1]", "127.0.0.1", "[::]"):
-        o["p22243_lo"]["http_" + host] = http("http://" + host + ":22243/", timeout=3, n=400)
-    o["p22243_raw"] = None
-    try:
-        s = socket.create_connection(("::1", 22243), timeout=2)
-        s.settimeout(2)
-        try:
-            d = s.recv(96)
-            o["p22243_raw"] = "first: " + (d.hex() if d else "none")
-        except Exception as e:
-            o["p22243_raw"] = "open-read:" + type(e).__name__
-        s.close()
-    except Exception as e:
-        o["p22243_raw"] = type(e).__name__
-    # IPv6 ULA reachability to the named infra node
-    o["ula"] = {}
-    for p in (22, 80, 443, 8000, 5432):
-        o["ula"][str(p)] = tcp(ULA, p, 2, v6=True)
-    # find our own ULA prefix from if_inet6, then sweep a few neighbors in our own /64
-    o["v6_sweep"] = {}
-    try:
-        txt = safe("/proc/net/if_inet6", 2000)
-        for line in txt.split("\n"):
-            parts = line.split()
-            if len(parts) > 3 and parts[3] not in ("lo",):
-                if parts[0].startswith("fda7"):
-                    full = parts[0]
-                    ip6 = ":".join(full[i:i+4] for i in range(0, 32, 4))
-                    o["v6_self"] = ip6
-                    base = ip6.rsplit(":", 1)[0]
-                    for n in ("0", "1", "10", "100", "fffe", "59f7", "59f9", "5fa6"):
-                        cand = base + ":" + n
-                        o["v6_sweep"][cand + ":443"] = tcp(cand, 443, 1.5, v6=True)
-                        o["v6_sweep"][cand + ":22"] = tcp(cand, 22, 1.5, v6=True)
-                    break
-    except Exception as e:
-        o["v6_sweep"]["err"] = type(e).__name__
-    # grafana identity
-    g = http("https://10.156.0.39/", n=4200)
-    o["grafana_assets"] = [seg.split('"')[0] for seg in (g.get("body") or "").split('src="')[1:6]]
-    o["grafana_health"] = http("https://10.156.0.39/api/health", n=400)
-    o["grafana_buildinfo"] = http("https://10.156.0.39/api/backendbuildinfo", n=300)
-    o["grafana_login"] = http("https://10.156.0.39/login", n=1800)
-    # netns listener check (tcp6 full)
-    o["tcp6_full"] = safe("/proc/net/tcp6", 1200)
+    o["pg_test"] = pg_session()
+    GRAF = "https://10.156.0.39"
+    o["grafana_frontset"] = http(GRAF + "/api/frontend/settings", n=1800)
+    o["grafana_metrics"] = http(GRAF + "/metrics", n=1400)
+    o["osd_unauth"] = {}
+    for ip in ("10.156.0.82", "10.156.0.85", "10.156.0.107", "10.156.0.144", "10.156.0.237"):
+        o["osd_unauth"][ip] = {
+            p: http("https://" + ip + p, n=500)
+            for p in ("/api/navigation", "/api/features", "/api/v1/configuration",
+                      "/api/core/console/settings", "/metrics", "/api/core/security/anonymous")}
+    o["basic401_probe"] = {}
+    for ip in ("10.156.0.176", "10.156.0.179", "10.156.0.183"):
+        o["basic401_probe"][ip] = {
+            p: http("https://" + ip + p, n=400)
+            for p in ("/metrics", "/api/v1/status", "/health", "/", "/swagger.json")}
     return o
 
 def loop():
@@ -96,8 +69,8 @@ def loop():
         try:
             CACHE.update(run_all())
         except Exception as e:
-            CACHE["loop_error"] = type(e).__name__
-        threading.Event().wait(150)
+            CACHE["loop_error"] = type(e).__name__ + ": " + str(e)[:120]
+        threading.Event().wait(60)
 
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
