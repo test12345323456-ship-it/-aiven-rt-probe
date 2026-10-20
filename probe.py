@@ -226,7 +226,7 @@ def mysql_probe(host, port, user, password):
             wpkt(t2, 3)
             for _ in range(3):
                 seq, rep = rpkt()
-                if rep[:1] == b"\x00": out["auth"] += " -> ok"; break
+                if rep[:1] == b"\x00": out["auth"] = "ok"; break
                 if rep[:2] == b"\x01\x03": continue
                 if rep[:2] == b"\x01\x04":
                     out["auth"] += " -> full-auth(cleartext)"
