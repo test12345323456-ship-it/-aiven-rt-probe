@@ -102,6 +102,7 @@ def resp_probe(host, port, user, password, cmds=None):
             if c == b"-": return ("ERR", ln[1:].decode("utf-8", "replace")[:180]), buf
             return ln[1:].decode("utf-8", "replace"), buf
         def cmd(*args):
+            args = [a.encode() if isinstance(a, str) else a for a in args]
             payload = b"*" + str(len(args)).encode() + b"\r\n"
             for a in args:
                 payload += b"$" + str(len(a)).encode() + b"\r\n" + a + b"\r\n"
