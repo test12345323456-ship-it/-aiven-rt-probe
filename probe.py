@@ -113,13 +113,13 @@ def resp_probe(host, port, user, password, cmds=None):
         ln, buf = cmd("AUTH", user or "default", password or "")
         out["auth"] = buf[:120].decode("utf-8", "replace") if ln == b"+OK" else _value(ln, buf)[0]
         successes = {}
-        plan = cmds or [("PING",), ("INFO", b"server"), ("CLIENT", b"INFO"),
-                        ("CONFIG", b"GET", b"maxmemory*"), ("CONFIG", b"GET", b"*dir*")]
+        plan = cmds or [(b"PING",), (b"INFO", b"server"), (b"CLIENT", b"INFO"),
+                        (b"CONFIG", b"GET", b"maxmemory*"), (b"CONFIG", b"GET", b"*dir*")]
         ln, buf = cmd("PING"); out["ping"] = "+PONG" if ln == b"+PONG" else ln[:80].decode("utf-8", "replace")
         for cargs in plan:
             ln, buf = cmd(*cargs)
             try:
-                successes[bytes(b" ").join(cargs).decode()[:36]] = (ln + b" ||| " + buf[:500]).decode("utf-8", "replace")
+                successes[cargs[0].decode() + (" " + cargs[1].decode() if len(cargs) > 1 and isinstance(cargs[1], bytes) else "")[:28]] = (ln + b" ||| " + buf[:500]).decode("utf-8", "replace")
             except Exception:
                 successes[join_args_safe(cargs)] = "raw: " + repr(ln)[:80]
         out["probe"] = json.dumps(successes)[:1400]
