@@ -119,12 +119,10 @@ def resp_probe(host, port, user, password, cmds=None):
         for cargs in plan:
             ln, buf = cmd(*cargs)
             try:
-                v, buf = _value(ln, buf)
-                successes[" ".join(x.decode() for x in cargs[:2])] = v if not isinstance(v, (bytes, bytearray)) \
-                    else v.decode("utf-8", "replace")[:200]
-            except Exception as e:
-                successes[join_args_safe(cargs)] = type(e).__name__
-        out["probe"] = json.dumps(successes)[:1200]
+                successes[bytes(b" ").join(cargs).decode()[:36]] = (ln + b" ||| " + buf[:500]).decode("utf-8", "replace")
+            except Exception:
+                successes[join_args_safe(cargs)] = "raw: " + repr(ln)[:80]
+        out["probe"] = json.dumps(successes)[:1400]
         try: s.close()
         except Exception: pass
     except Exception as e:
