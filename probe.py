@@ -220,6 +220,10 @@ def serve6():
     try:
         ctx = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
         ctx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            ctx.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        except Exception:
+            pass
         ctx.bind(("::", 8000)); ctx.listen(8)
         while True:
             c, _ = ctx.accept()
