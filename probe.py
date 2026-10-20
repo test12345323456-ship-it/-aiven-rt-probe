@@ -165,6 +165,12 @@ def mysql_probe(host, port, user, password):
         p2 = hashlib.sha1(p1).digest()
         sb = hashlib.sha1(salt + p2).digest()
         return bytes(a ^ b for a, b in zip(sb, p1))
+    def token_sha2(pw, nonce):
+        if not pw: return b""
+        s1 = hashlib.sha256(pw.encode()).digest()
+        s2 = hashlib.sha256(s1).digest()
+        s3 = hashlib.sha256(s2 + nonce).digest()
+        return bytes(a ^ b for a, b in zip(s3, s1))
     try:
         s = socket.create_connection((host, int(port)), timeout=8)
         s.settimeout(10)
@@ -216,10 +222,19 @@ def mysql_probe(host, port, user, password):
             sw_plugin = rep[1:j2].decode("utf-8", "replace")
             sw_salt = rep[j2 + 1:j2 + 21]
             out["auth"] = "switch:" + sw_plugin
-            t2 = token_native(password, sw_salt) if "native" in sw_plugin else b""
+            t2 = token_native(password, sw_salt) if "native" in sw_plugin else (token_sha2(password, sw_salt) if "sha2" in sw_plugin else b"")
             wpkt(bytes([len(t2)]) + t2, 3)
-            seq, rep = rpkt()
-            out["auth"] += " -> " + ("ok" if rep[:1] == b"\x00" else "err " + rep[3:120].decode("utf-8", "replace"))
+            for _ in range(3):
+                seq, rep = rpkt()
+                if rep[:1] == b"\x00": out["auth"] += " -> ok"; break
+                if rep[:2] == b"\x01\x03": continue
+                if rep[:2] == b"\x01\x04":
+                    out["auth"] += " -> full-auth(cleartext)"
+                    wpkt(password.encode() + b"\x00", 5)
+                    continue
+                if rep[:1] == b"\xff":
+                    out["auth"] += " -> err " + rep[3:120].decode("utf-8", "replace"); break
+                out["auth"] += " -> ?" + repr(rep[:40]); break
         else:
             out["auth"] = "unexpected " + str(rep[:70])
         if out["auth"] != "ok":
