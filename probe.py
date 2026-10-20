@@ -195,6 +195,7 @@ def mysql_probe(host, port, user, password):
         try: salt2 = hs[i:i + 13].split(b"\x00")[0][:12]
         except Exception: salt2 = b""
         salt = (salt + salt2)[:20]
+        i += 13
         els = hs[i:].split(b"\x00")
         plugin = els[0].decode("utf-8", "replace") if els and els[0] else "unknown"
         out["handshake"] = {"ver": ver, "caps": hex(caps), "plugin": plugin}
@@ -211,9 +212,9 @@ def mysql_probe(host, port, user, password):
             out["auth"] = "err " + rep[3:9].decode("latin1") + " " + rep[9:170].decode("utf-8", "replace")
             return out
         elif rep[:1] == b"\xfe":
-            sel = rep.split(b"\x00")
-            sw_plugin = sel[1].decode("utf-8", "replace") if len(sel) > 1 else ""
-            sw_salt = sel[2][:20] if len(sel) > 2 else salt
+            j2 = rep.index(b"\x00", 1)
+            sw_plugin = rep[1:j2].decode("utf-8", "replace")
+            sw_salt = rep[j2 + 1:j2 + 21]
             out["auth"] = "switch:" + sw_plugin
             t2 = token_native(password, sw_salt) if "native" in sw_plugin else b""
             wpkt(bytes([len(t2)]) + t2, 3)
