@@ -223,7 +223,7 @@ def mysql_probe(host, port, user, password):
             sw_salt = rep[j2 + 1:j2 + 21]
             out["auth"] = "switch:" + sw_plugin
             t2 = token_native(password, sw_salt) if "native" in sw_plugin else (token_sha2(password, sw_salt) if "sha2" in sw_plugin else b"")
-            wpkt(bytes([len(t2)]) + t2, 3)
+            wpkt(t2, 3)
             for _ in range(3):
                 seq, rep = rpkt()
                 if rep[:1] == b"\x00": out["auth"] += " -> ok"; break
